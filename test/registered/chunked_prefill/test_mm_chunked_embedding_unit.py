@@ -249,6 +249,60 @@ def test_cross_request_encoder_batch_respects_token_budget():
     assert list(embeddings) == [(2000, 2), (2001, 2), (2002, 2)]
 
 
+def test_encoder_microbatch_releases_uploaded_features_before_next_batch(monkeypatch):
+    mm_schedule.init_mm_embedding_cache(1 << 30)
+    items = _make_items_with_encoder_tokens([6, 5, 7])
+    host_features = [item.feature for item in items]
+    requests = [
+        mm_schedule.PerImageRequestInfo(i, [item], [(0, 1)], 0, 2)
+        for i, item in enumerate(items)
+    ]
+    calls = []
+
+    def upload(item_batch, _device):
+        for item in item_batch:
+            item.feature = item.feature.clone()
+
+    def encoder(item_batch):
+        assert all(
+            item.feature is not host_features[item.hash - 2000] for item in item_batch
+        )
+        if calls:
+            assert items[0].feature is host_features[0]
+            assert items[1].feature is host_features[1]
+        calls.append([item.hash for item in item_batch])
+        return torch.zeros(len(item_batch) * 2, HIDDEN)
+
+    monkeypatch.setattr(mm_schedule, "_move_items_to_device", upload)
+    with get_mm().override(mm_max_encoder_input_tokens_per_batch=12):
+        mm_schedule._batch_encode_per_image_misses(encoder, requests, _CPU)
+
+    assert calls == [[2000, 2001], [2002]]
+    assert all(item.feature is host for item, host in zip(items, host_features))
+
+
+def test_encoder_microbatch_restores_host_features_on_failure(monkeypatch):
+    mm_schedule.init_mm_embedding_cache(1 << 30)
+    item = _make_items_with_encoder_tokens([6])[0]
+    host_feature = item.feature
+    request = mm_schedule.PerImageRequestInfo(0, [item], [(0, 1)], 0, 2)
+
+    def upload(item_batch, _device):
+        item_batch[0].feature = item_batch[0].feature.clone()
+
+    def fail(_item_batch):
+        raise RuntimeError("encoder failed")
+
+    monkeypatch.setattr(mm_schedule, "_move_items_to_device", upload)
+    with (
+        pytest.raises(RuntimeError, match="encoder failed"),
+        get_mm().override(mm_max_encoder_input_tokens_per_batch=12),
+    ):
+        mm_schedule._batch_encode_per_image_misses(fail, [request], _CPU)
+
+    assert item.feature is host_feature
+
+
 def test_by_item_mismatched_cache_entry_is_reencoded():
     mm_schedule.init_mm_embedding_cache(1 << 30)
     items = _make_items()

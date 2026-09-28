@@ -464,9 +464,27 @@ def _batch_encode_per_image_misses(
             item_offset += len(item_batch)
             token_counts = [unique_misses[key][1] for key in batch_cache_keys]
 
-            if not _can_skip_pre_embed_feature_move(data_embedding_func):
-                _move_items_to_device(item_batch, device)
-            batch_embedding = data_embedding_func(item_batch)
+            # Keep raw inputs on the host between encoder microbatches.
+            move_features = not _can_skip_pre_embed_feature_move(data_embedding_func)
+            host_features = (
+                [
+                    item.feature
+                    if isinstance(item.feature, torch.Tensor)
+                    and item.feature.device.type == "cpu"
+                    else None
+                    for item in item_batch
+                ]
+                if move_features
+                else []
+            )
+            try:
+                if move_features:
+                    _move_items_to_device(item_batch, device)
+                batch_embedding = data_embedding_func(item_batch)
+            finally:
+                for item, host_feature in zip(item_batch, host_features):
+                    if host_feature is not None:
+                        item.feature = host_feature
 
             if isinstance(batch_embedding, list):
                 assert len(batch_embedding) == len(item_batch), (
